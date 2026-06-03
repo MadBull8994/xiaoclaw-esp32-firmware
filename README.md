@@ -1,5 +1,21 @@
 # XiaoClaw: AI Voice Assistant with Local Agent Brain
 
+> **XiaoClawBrain fork note**
+>
+> This repository is currently used as the **ESP32 firmware line** for the XiaoClawBrain project.
+> In the XiaoClawBrain production path, the device acts as a **thin client** and pairs with the backend server repo:
+> - Backend server line: `MadBull8994/xiaozhi-esp32-server`
+> - Workspace docs and coordination: `MadBull8994/xiaoclawbrain-workspace`
+>
+> Current XiaoClawBrain usage focus:
+> - ESP32-S3 audio input/output
+> - wake word / button entry
+> - display and local device state
+> - WebSocket binary protocol
+> - local fallback prompts
+>
+> Note: parts of this README describe broader XiaoClaw/local-agent capabilities from the source project history. The active XiaoClawBrain mainline uses this repo primarily as the firmware/device half of a thin-device + fat-server architecture.
+
 <p align="center">
   <strong>ESP32-S3 AI Voice Assistant — Voice I/O + Local LLM Agent</strong>
 </p>
