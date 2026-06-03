@@ -7,6 +7,7 @@
 
 extern "C" {
 #include "mimi/bus/message_bus.h"
+#include "mimi/agent/agent_loop.h"
 }
 
 static const char *TAG = "bridge";
@@ -39,6 +40,12 @@ esp_err_t bridge_send_to_agent(const char *text)
     if (text == nullptr) {
         ESP_LOGW(TAG, "bridge_send_to_agent: text is NULL");
         return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t start_err = agent_loop_start();
+    if (start_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start Agent loop: %s", esp_err_to_name(start_err));
+        return start_err;
     }
 
     mimi_msg_t msg = {0};
@@ -113,9 +120,12 @@ esp_err_t bridge_start(void)
         return ESP_OK;
     }
 
-    s_bridge_stack = heap_caps_malloc(BRIDGE_TASK_STACK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_bridge_stack = heap_caps_malloc(BRIDGE_TASK_STACK_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_bridge_stack) {
-        ESP_LOGE(TAG, "Failed to allocate bridge task stack from PSRAM");
+        s_bridge_stack = heap_caps_malloc(BRIDGE_TASK_STACK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_bridge_stack) {
+        ESP_LOGE(TAG, "Failed to allocate bridge task stack");
         return ESP_ERR_NO_MEM;
     }
 

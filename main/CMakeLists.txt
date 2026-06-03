@@ -29,6 +29,9 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "xiaoclaw_ws_client.cc"
+            "providers/openclaw_runtime_config_logic.c"
+            "providers/openclaw_runtime_config.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -39,43 +42,7 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
-# Mimiclaw Agent Engine sources
-list(APPEND SOURCES
-    "mimi/mimi.c"
-    "mimi/bus/message_bus.c"
-    "mimi/agent/agent_loop.c"
-    "mimi/agent/runner.c"
-    "mimi/agent/context_builder.c"
-    "mimi/llm/llm_proxy.c"
-    "mimi/tools/tool_registry.c"
-    "mimi/tools/tool_web_search.c"
-    "mimi/tools/tool_files.c"
-    "mimi/tools/tool_get_time.c"
-    "mimi/tools/tool_cron.c"
-    "mimi/tools/tool_mcp_client.c"
-    "mimi/tools/tool_lua.c"
-    "mimi/tools/lua_cjson.c"
-    "mimi/tools/lua_socket_http.c"
-    "mimi/memory/memory_store.c"
-    "mimi/memory/session_manager.c"
-    "mimi/memory/consolidator.c"
-    "mimi/proxy/http_proxy.c"
-    "mimi/skills/skill_loader.c"
-    "mimi/skills/skill_meta.c"
-    "mimi/skills/skill_crystallize.c"
-    "mimi/agent/learning_hooks.c"
-    "mimi/memory/hierarchy.c"
-    "mimi/cron/cron_service.c"
-    "mimi/heartbeat/heartbeat.c"
-    "mimi/util/fatfs_util.c"
-)
-
-# Bridge layer sources
-list(APPEND SOURCES
-    "bridge/bridge.cc"
-)
-
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "mimi" "bridge")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "providers")
 
 # Add board common files
 list(APPEND SOURCES
@@ -698,6 +665,11 @@ elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_1_54TFT_WIFI)
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+elseif(CONFIG_BOARD_TYPE_OPENCLAW_V2_7)
+    set(BOARD_TYPE "openclaw-v2.7")
+    set(BUILTIN_TEXT_FONT font_puhui_basic_16_4)
+    set(BUILTIN_ICON_FONT font_awesome_16_4)
+    set(DEFAULT_EMOJI_COLLECTION twemoji_32)
 elseif(CONFIG_BOARD_TYPE_MINSI_K08_DUAL)
     set(BOARD_TYPE "minsi-k08-dual")
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
@@ -962,6 +934,7 @@ idf_component_register(SRCS ${SOURCES}
                         json
                         spiffs
                         esp-tls
+                        tcp_transport
                         mbedtls
                         esp_driver_gpio
                         esp_driver_uart

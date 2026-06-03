@@ -9,14 +9,13 @@
 #include <time.h>
 
 #include "application.h"
-#include "mimi/mimi_config.h"
 
 #define TAG "main"
 
 extern "C" void app_main(void)
 {
-    // Initialize timezone (POSIX format: UTC-8 = UTC+8 for China)
-    setenv("TZ", MIMI_TIMEZONE, 1);
+    // Initialize timezone for China (UTC+8)
+    setenv("TZ", "CST-8", 1);
     tzset();
 
     // Initialize NVS flash for WiFi configuration

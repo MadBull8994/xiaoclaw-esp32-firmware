@@ -75,7 +75,7 @@
 #define MIMI_FEISHU_WEBHOOK_MAX_BODY     (16 * 1024)
 
 /* Agent Loop */
-#define MIMI_AGENT_STACK             (24 * 1024)
+#define MIMI_AGENT_STACK             (16 * 1024)
 #define MIMI_AGENT_PRIO              6
 #define MIMI_AGENT_CORE              1
 #define MIMI_AGENT_MAX_HISTORY       20
@@ -91,7 +91,7 @@
 #define MIMI_LLM_PROVIDER_DEFAULT    "anthropic"
 #define MIMI_LLM_MAX_TOKENS          4096
 #define MIMI_LLM_API_URL             "https://api.anthropic.com/v1/messages"
-#define MIMI_OPENAI_API_URL          "https://api.openai.com/v1/chat/completions"
+#define MIMI_OPENAI_API_URL          "https://api.deepseek.com/v1/chat/completions"
 #define MIMI_LLM_API_VERSION         "2023-06-01"
 #define MIMI_LLM_STREAM_BUF_SIZE     (32 * 1024)
 #define MIMI_LLM_LOG_VERBOSE_PAYLOAD 0

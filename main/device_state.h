@@ -13,7 +13,14 @@ enum DeviceState {
     kDeviceStateUpgrading,
     kDeviceStateActivating,
     kDeviceStateAudioTesting,
-    kDeviceStateFatalError
+    kDeviceStateFatalError,
+    kDeviceStateError,
+    // P5.1 XiaoClaw thin-client states
+    kDeviceStateWakeupDetected,
+    kDeviceStateUploadingAudio,
+    kDeviceStateRecognizing,
+    kDeviceStateSynthesizing,
+    kDeviceStateReconnecting,
 };
 
 #endif // _DEVICE_STATE_H_ 

@@ -17,6 +17,8 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 
+class XiaoClawWsClient;
+
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
 #define MAIN_EVENT_SEND_AUDIO           (1 << 1)
@@ -103,6 +105,12 @@ public:
      */
     void StopListening();
 
+    bool XiaoClawSendListenStart(ListeningMode mode = kListeningModeManualStop);
+    bool XiaoClawSendListenStop();
+    bool XiaoClawStartAudioUpload();
+    void XiaoClawStopAudioUpload();
+    void XiaoClawAbortCurrentPlayback();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -112,6 +120,8 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    XiaoClawWsClient* GetXiaoClawWsClient() const { return xiaoclaw_ws_client_.get(); }
+    void SetXiaoClawBootListening(bool enabled) { xiaoclaw_boot_listening_ = enabled; }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -120,24 +130,6 @@ public:
      */
     void ResetProtocol();
 
-    /**
-     * @brief Handle Agent response from mimiclaw
-     * Called by the Bridge layer when Agent returns a response
-     * @param text The response text from Agent
-     */
-    void HandleAgentResponse(const std::string& text);
-
-    /**
-     * @brief Static callback for Bridge layer
-     */
-    static void OnAgentResponseCallback(const char* text);
-
-    /**
-     * @brief Initialize mimiclaw Agent engine
-     * Called after WiFi is connected
-     */
-    void InitializeMimiclaw();
-
 private:
     Application();
     ~Application();
@@ -145,8 +137,14 @@ private:
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
     std::unique_ptr<Protocol> protocol_;
+    std::unique_ptr<XiaoClawWsClient> xiaoclaw_ws_client_;
+    bool xiaoclaw_boot_listening_ = false;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    esp_timer_handle_t xiaoclaw_recognizing_timeout_timer_ = nullptr;
+    esp_timer_handle_t xiaoclaw_reconnect_timer_ = nullptr;
+    int xiaoclaw_reconnect_delay_ms_ = 2000;
+    bool xiaoclaw_reconnect_in_progress_ = false;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -157,8 +155,9 @@ private:
     bool has_server_time_ = false;
     bool aborted_ = false;
     bool assets_version_checked_ = false;
-    bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    bool play_popup_on_listening_ = false;
     int clock_ticks_ = 0;
+    int64_t last_wake_word_time_ms_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
 
@@ -187,8 +186,17 @@ private:
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
+    void InitializeXiaoClawWsClient();
+    bool IsXiaoClawWsReady() const;
+    bool XiaoClawSendWakeWordDetected(const std::string& wake_word);
+    bool XiaoClawBeginListening(ListeningMode mode);
+    void OnOpusFrameFromAudio(const uint8_t* data, size_t len);
+    void OnTtsBinaryFrame(const uint8_t* data, size_t len);
+    void StartRecognizingTimeout();
+    void CancelRecognizingTimeout();
+    void StartXiaoClawReconnectTimer();
+    void TryXiaoClawReconnect();
 };
-
 
 class TaskPriorityReset {
 public:

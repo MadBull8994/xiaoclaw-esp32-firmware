@@ -6,6 +6,13 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config XIAOZHI_SKIP_OTA_VERSION_CHECK
+    bool "Skip Xiaozhi cloud OTA version check"
+    default n
+    help
+        Skip the legacy Xiaozhi cloud OTA/version activation check. This is useful
+        when validating XiaoClawBrain against a local backend.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE
@@ -527,6 +534,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_HU_087
         bool "HU-087"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_OPENCLAW_V2_7
+        bool "OpenClaw V2.7"
+        depends on IDF_TARGET_ESP32S3
 endchoice
 
 choice
@@ -1024,6 +1034,33 @@ menu "Secret Configuration"
         default ""
         help
             Tavily Search API key for web search (get from https://tavily.com/)
+
+    menu "XiaoClawBrain WebSocket Configuration"
+        config XIAOCLAW_WS_URL
+            string "XiaoClawBrain WebSocket URL"
+            default "ws://192.168.1.10:8000/xiaozhi/v1/"
+            help
+                WebSocket URL for XiaoClawBrain backend connection.
+
+        config XIAOCLAW_DEVICE_TOKEN
+            string "XiaoClawBrain Device Token"
+            default ""
+            help
+                Device token for XiaoClawBrain authentication.
+                Logs only report SET or EMPTY.
+
+        config XIAOCLAW_DEVICE_ID
+            string "XiaoClawBrain Device ID"
+            default "esp32s3-xiaoclaw"
+            help
+                Unique device identifier sent to XiaoClawBrain backend.
+
+        config XIAOCLAW_CLIENT_ID
+            string "XiaoClawBrain Client ID"
+            default "esp32s3-client"
+            help
+                Client identifier sent to XiaoClawBrain backend.
+    endmenu
 endmenu
 
 endmenu

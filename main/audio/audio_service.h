@@ -79,7 +79,9 @@ struct AudioServiceCallbacks {
     std::function<void(void)> on_send_queue_available;
     std::function<void(const std::string&)> on_wake_word_detected;
     std::function<void(bool)> on_vad_change;
+    std::function<void(const int16_t* data, size_t samples)> on_pcm_output;
     std::function<void(void)> on_audio_testing_queue_full;
+    std::function<void(const uint8_t* data, size_t len)> on_opus_frame;
 };
 
 
@@ -113,6 +115,7 @@ public:
     void EncodeWakeWord();
     std::unique_ptr<AudioStreamPacket> PopWakeWordPacket();
     const std::string& GetLastWakeWord() const;
+    void DiscardPreWakeAudioOnNextFlush();
     bool IsVoiceDetected() const { return voice_detected_; }
     bool IsIdle();
     void WaitForPlaybackQueueEmpty();
@@ -131,7 +134,14 @@ public:
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
-    void PlayOpusData(const std::vector<uint8_t>& opus_data, int sample_rate = 24000);
+    void PlayOpusData(const std::vector<uint8_t>& opus_data,
+                    int sample_rate = 24000,
+                    int frame_duration_ms = 60);
+    void PlayTtsBinaryFrame(const uint8_t* data,
+                             size_t len,
+                             int sample_rate = 24000,
+                             int frame_duration_ms = 60);
+    bool PlayPcmData(std::vector<int16_t>&& pcm);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
@@ -193,6 +203,17 @@ private:
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
+
+    // Pre-wake ring buffer: captures raw PCM during the gap between
+    // wake word detection and audio processor start.
+    void WritePreWakeRingBuffer(const std::vector<int16_t>& data);
+    std::vector<int16_t> PopPreWakeRingBuffer();
+    void FlushPreWakeRingBuffer();
+    static constexpr size_t kPreWakeRingBufferSize = 16000; // 1s @ 16kHz
+    std::vector<int16_t> pre_wake_ring_buffer_;
+    size_t pre_wake_ring_write_pos_ = 0;
+    bool pre_wake_ring_full_ = false;
+    bool discard_pre_wake_on_next_flush_ = false;
 };
 
 #endif

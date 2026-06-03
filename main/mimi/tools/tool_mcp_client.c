@@ -554,7 +554,7 @@ static esp_err_t handle_tools_list(const char *resp_json)
             strncpy(local_name, name->valuestring, sizeof(local_name) - 1);
             local_name[sizeof(local_name) - 1] = '\0';
         } else {
-            /* Use prefixed name (e.g., "mcp_server.echo") */
+            /* Use prefixed name (e.g., "mcp_server_echo") */
             snprintf(local_name, sizeof(local_name), "%s.%s",
                      s_server_config.endpoint, name->valuestring);
         }
@@ -928,7 +928,7 @@ esp_err_t mcp_load_all_server_configs(mcp_server_config_t configs[], int max_cou
  * @brief Connect to server and register remote tools as first-class citizens
  *
  * Remote tools are registered with their actual names (e.g., "hue.set_color")
- * instead of prefixed names (e.g., "mcp_server.hue.set_color").
+ * instead of prefixed names (e.g., "mcp_server_hue.set_color").
  */
 esp_err_t mcp_connect_and_register(const char *server_name)
 {
@@ -1073,7 +1073,7 @@ static esp_err_t mcp_tool_disconnect(const char *input_json, char *output, size_
 }
 
 /**
- * @brief mcp_server.tools_call tool implementation
+ * @brief mcp_server_tools_call tool implementation
  * Input: {"name": "echo", "arguments": {"message": "Hello"}}
  *
  * This allows calling arbitrary remote MCP tools by name.
@@ -1201,7 +1201,7 @@ static esp_err_t mcp_tools_call_exec(const char *input_json, char *output, size_
 }
 
 /**
- * @brief mcp_server.tools_list tool implementation
+ * @brief mcp_server_tools_list tool implementation
  * Input: {} or {"cursor": ""}
  *
  * Convenience tool that calls the remote MCP server's tools/list method.
@@ -1267,7 +1267,7 @@ esp_err_t tool_mcp_client_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Registering MCP dynamic tools (mcp_connect, mcp_disconnect, mcp_server.tools_call, mcp_server.tools_list)");
+    ESP_LOGI(TAG, "Registering MCP dynamic tools (mcp_connect, mcp_disconnect, mcp_server_tools_call, mcp_server_tools_list)");
 
     /* Register mcp_connect tool */
     mimi_tool_t connect_tool = {
@@ -1291,11 +1291,11 @@ esp_err_t tool_mcp_client_init(void)
     };
     ESP_ERROR_CHECK(tool_registry_add(&disconnect_tool));
 
-    /* Register mcp_server.tools_call tool */
+    /* Register mcp_server_tools_call tool */
     mimi_tool_t tools_call_tool = {
-        .name = "mcp_server.tools_call",
+        .name = "mcp_server_tools_call",
         .description = "Call a remote MCP tool by name. Input: {\"name\": \"tool_name\", \"arguments\": {}}. "
-                       "Use mcp_server.tools_list to list available tools.",
+                       "Use mcp_server_tools_list to list available tools.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"arguments\":{\"type\":\"object\"}},\"required\":[\"name\"]}",
         .execute = mcp_tools_call_exec,
         .concurrency_safe = false,
@@ -1303,9 +1303,9 @@ esp_err_t tool_mcp_client_init(void)
     };
     ESP_ERROR_CHECK(tool_registry_add(&tools_call_tool));
 
-    /* Register mcp_server.tools_list tool */
+    /* Register mcp_server_tools_list tool */
     mimi_tool_t tools_list_tool = {
-        .name = "mcp_server.tools_list",
+        .name = "mcp_server_tools_list",
         .description = "List all available tools on the remote MCP server. Input: {}.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"cursor\":{\"type\":\"string\"}},\"required\":[]}",
         .execute = mcp_tools_list_exec,

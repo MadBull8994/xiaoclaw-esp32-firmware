@@ -4,6 +4,14 @@
 #include <stddef.h>
 
 /**
+ * Preload prompt files (SOUL.md, USER.md, MEMORY.md) into RAM.
+ * Must be called from internal-stack context (e.g. mimiclaw_init)
+ * before any PSRAM-stack task calls context_build_system_prompt.
+ * SPI flash background ops would assert on PSRAM-stack tasks.
+ */
+void context_preload_files(void);
+
+/**
  * Build the system prompt from bootstrap files (SOUL.md, USER.md)
  * and memory context (MEMORY.md + recent daily notes).
  *

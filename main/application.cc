@@ -6,27 +6,25 @@
 #include "audio_codec.h"
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
+#include "xiaoclaw_ws_client.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
-#include "bridge/bridge.h"
-
-extern "C" {
-#include "mimi/mimi.h"
-}
+#include "esp_netif_sntp.h"
 
 #include <cstring>
+#include <new>
 #include <vector>
+#include <algorithm>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cJSON.h>
-#include <mbedtls/base64.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
 #define TAG "Application"
-
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -52,12 +50,55 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    esp_timer_create_args_t recog_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            app->Schedule([app]() {
+                auto state = app->GetDeviceState();
+                if (state == kDeviceStateRecognizing) {
+                    ESP_LOGW(TAG, "recognizing timeout -> idle");
+                    if (app->xiaoclaw_ws_client_) {
+                        app->xiaoclaw_ws_client_->SetUploadingEnabled(false);
+                    }
+                    app->SetDeviceState(kDeviceStateIdle);
+                }
+            });
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "recog_timeout",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&recog_timer_args, &xiaoclaw_recognizing_timeout_timer_);
+
+    esp_timer_create_args_t reconnect_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = static_cast<Application*>(arg);
+            app->Schedule([app]() {
+                app->TryXiaoClawReconnect();
+            });
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "xc_reconnect",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&reconnect_timer_args, &xiaoclaw_reconnect_timer_);
 }
 
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (xiaoclaw_recognizing_timeout_timer_ != nullptr) {
+        esp_timer_stop(xiaoclaw_recognizing_timeout_timer_);
+        esp_timer_delete(xiaoclaw_recognizing_timeout_timer_);
+    }
+    if (xiaoclaw_reconnect_timer_ != nullptr) {
+        esp_timer_stop(xiaoclaw_reconnect_timer_);
+        esp_timer_delete(xiaoclaw_reconnect_timer_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -91,11 +132,26 @@ void Application::Initialize() {
     callbacks.on_vad_change = [this](bool speaking) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
+    callbacks.on_pcm_output = nullptr;
+    callbacks.on_opus_frame = [this](const uint8_t* data, size_t len) {
+        this->OnOpusFrameFromAudio(data, len);
+    };
     audio_service_.SetCallbacks(callbacks);
 
     // Add state change listeners
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
+
+        if (new_state == kDeviceStateRecognizing) {
+            StartRecognizingTimeout();
+        } else if (new_state == kDeviceStateThinking ||
+                   new_state == kDeviceStateSynthesizing ||
+                   new_state == kDeviceStateSpeaking ||
+                   new_state == kDeviceStateIdle ||
+                   new_state == kDeviceStateError ||
+                   new_state == kDeviceStateReconnecting) {
+            CancelRecognizingTimeout();
+        }
     });
 
     // Start the clock timer to update the status bar
@@ -108,59 +164,61 @@ void Application::Initialize() {
 
     // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
-        auto display = Board::GetInstance().GetDisplay();
-        
-        switch (event) {
-            case NetworkEvent::Scanning:
-                display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
-                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
-                break;
-            case NetworkEvent::Connecting: {
-                if (data.empty()) {
-                    // Cellular network - registering without carrier info yet
-                    display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
-                } else {
-                    // WiFi or cellular with carrier info
-                    std::string msg = Lang::Strings::CONNECT_TO;
-                    msg += data;
-                    msg += "...";
-                    display->ShowNotification(msg.c_str(), 30000);
+        Schedule([this, event, data]() {
+            auto display = Board::GetInstance().GetDisplay();
+
+            switch (event) {
+                case NetworkEvent::Scanning:
+                    display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+                    break;
+                case NetworkEvent::Connecting: {
+                    if (data.empty()) {
+                        // Cellular network - registering without carrier info yet
+                        display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
+                    } else {
+                        // WiFi or cellular with carrier info
+                        std::string msg = Lang::Strings::CONNECT_TO;
+                        msg += data;
+                        msg += "...";
+                        display->ShowNotification(msg.c_str(), 30000);
+                    }
+                    break;
                 }
-                break;
+                case NetworkEvent::Connected: {
+                    std::string msg = Lang::Strings::CONNECTED_TO;
+                    msg += data;
+                    display->ShowNotification(msg.c_str(), 30000);
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
+                    break;
+                }
+                case NetworkEvent::Disconnected:
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+                    break;
+                case NetworkEvent::WifiConfigModeEnter:
+                    // WiFi config mode enter is handled by WifiBoard internally
+                    break;
+                case NetworkEvent::WifiConfigModeExit:
+                    // WiFi config mode exit is handled by WifiBoard internally
+                    break;
+                // Cellular modem specific events
+                case NetworkEvent::ModemDetecting:
+                    display->SetStatus(Lang::Strings::DETECTING_MODULE);
+                    break;
+                case NetworkEvent::ModemErrorNoSim:
+                    Alert(Lang::Strings::ERROR, Lang::Strings::PIN_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_PIN);
+                    break;
+                case NetworkEvent::ModemErrorRegDenied:
+                    Alert(Lang::Strings::ERROR, Lang::Strings::REG_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_REG);
+                    break;
+                case NetworkEvent::ModemErrorInitFailed:
+                    Alert(Lang::Strings::ERROR, Lang::Strings::MODEM_INIT_ERROR, "triangle_exclamation", Lang::Sounds::OGG_EXCLAMATION);
+                    break;
+                case NetworkEvent::ModemErrorTimeout:
+                    display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
+                    break;
             }
-            case NetworkEvent::Connected: {
-                std::string msg = Lang::Strings::CONNECTED_TO;
-                msg += data;
-                display->ShowNotification(msg.c_str(), 30000);
-                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
-                break;
-            }
-            case NetworkEvent::Disconnected:
-                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
-                break;
-            case NetworkEvent::WifiConfigModeEnter:
-                // WiFi config mode enter is handled by WifiBoard internally
-                break;
-            case NetworkEvent::WifiConfigModeExit:
-                // WiFi config mode exit is handled by WifiBoard internally
-                break;
-            // Cellular modem specific events
-            case NetworkEvent::ModemDetecting:
-                display->SetStatus(Lang::Strings::DETECTING_MODULE);
-                break;
-            case NetworkEvent::ModemErrorNoSim:
-                Alert(Lang::Strings::ERROR, Lang::Strings::PIN_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_PIN);
-                break;
-            case NetworkEvent::ModemErrorRegDenied:
-                Alert(Lang::Strings::ERROR, Lang::Strings::REG_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_REG);
-                break;
-            case NetworkEvent::ModemErrorInitFailed:
-                Alert(Lang::Strings::ERROR, Lang::Strings::MODEM_INIT_ERROR, "triangle_exclamation", Lang::Sounds::OGG_EXCLAMATION);
-                break;
-            case NetworkEvent::ModemErrorTimeout:
-                display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
-                break;
-        }
+        });
     });
 
     // Start network asynchronously
@@ -262,12 +320,24 @@ void Application::Run() {
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
             }
+
+            if (clock_ticks_ % 30 == 0 && xiaoclaw_ws_client_ && xiaoclaw_ws_client_->IsConnected()) {
+                xiaoclaw_ws_client_->SendPingJson();
+            }
         }
     }
 }
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+
+    /* Start SNTP time sync — required for HTTPS certificate validation.
+       System time is 1970-01-01 after cold boot; without sync, TLS handshake
+       to DeepSeek/LLM APIs fails because all certificates appear expired. */
+    esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp_config);
+    ESP_LOGI(TAG, "SNTP time sync started");
+
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -323,9 +393,167 @@ void Application::HandleActivationDoneEvent() {
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 
     Schedule([this]() {
-        // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     });
+
+    InitializeXiaoClawWsClient();
+}
+
+void Application::InitializeXiaoClawWsClient() {
+    xiaoclaw_ws_client_ = std::make_unique<XiaoClawWsClient>();
+
+    xiaoclaw_ws_client_->OnStateChange([this](const char* state) {
+        ESP_LOGI(TAG, "XiaoClaw server state=%s", state);
+        Display* display = Board::GetInstance().GetDisplay();
+        display->SetStatus(state);
+
+        if (strcmp(state, "idle") == 0) {
+            SetDeviceState(kDeviceStateIdle);
+        } else if (strcmp(state, "wakeup_detected") == 0) {
+            {
+                auto current = GetDeviceState();
+                if (current == kDeviceStateIdle || current == kDeviceStateConnecting) {
+                    SetDeviceState(kDeviceStateWakeupDetected);
+                } else {
+                    ESP_LOGI(TAG, "Ignore regressive remote state=wakeup_detected, current=%s",
+                             DeviceStateMachine::GetStateName(current));
+                }
+            }
+        } else if (strcmp(state, "listening") == 0) {
+            SetDeviceState(kDeviceStateListening);
+        } else if (strcmp(state, "uploading_audio") == 0) {
+            SetDeviceState(kDeviceStateUploadingAudio);
+        } else if (strcmp(state, "recognizing") == 0) {
+            SetDeviceState(kDeviceStateRecognizing);
+        } else if (strcmp(state, "thinking") == 0) {
+            SetDeviceState(kDeviceStateThinking);
+        } else if (strcmp(state, "synthesizing") == 0) {
+            SetDeviceState(kDeviceStateSynthesizing);
+        } else if (strcmp(state, "speaking") == 0) {
+            SetDeviceState(kDeviceStateSpeaking);
+        } else if (strcmp(state, "error") == 0) {
+            SetDeviceState(kDeviceStateError);
+        } else if (strcmp(state, "reconnecting") == 0) {
+            SetDeviceState(kDeviceStateReconnecting);
+        }
+    });
+
+    xiaoclaw_ws_client_->OnConnected([this]() {
+        ESP_LOGI(TAG, "XiaoClaw WS connected");
+        xiaoclaw_reconnect_delay_ms_ = 2000;
+        if (xiaoclaw_reconnect_timer_ != nullptr) {
+            esp_timer_stop(xiaoclaw_reconnect_timer_);
+        }
+
+        Display* display = Board::GetInstance().GetDisplay();
+        display->SetStatus("idle");
+
+        auto state = GetDeviceState();
+        if (state == kDeviceStateReconnecting || state == kDeviceStateError) {
+            SetDeviceState(kDeviceStateIdle);
+        }
+    });
+
+    xiaoclaw_ws_client_->OnDisconnected([this]() {
+        if (xiaoclaw_reconnect_in_progress_) {
+            return;
+        }
+
+        auto state = GetDeviceState();
+        int64_t uptime_ms = esp_timer_get_time() / 1000;
+        ESP_LOGW(TAG,
+                 "XiaoClaw WS disconnected uptime_ms=%lld state_before=%s",
+                 uptime_ms,
+                 DeviceStateMachine::GetStateName(state));
+
+        if (xiaoclaw_ws_client_) {
+            xiaoclaw_ws_client_->SetUploadingEnabled(false);
+        }
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.EnableWakeWordDetection(false);
+        SetXiaoClawBootListening(false);
+
+        Display* display = Board::GetInstance().GetDisplay();
+        display->SetStatus("reconnecting");
+        SetDeviceState(kDeviceStateReconnecting);
+        StartXiaoClawReconnectTimer();
+    });
+
+    xiaoclaw_ws_client_->OnTtsStart([this]() {
+        // Reset decoder and queues before the first TTS binary frame arrives.
+        // Doing this in kDeviceStateSpeaking races with the first frame and can
+        // drop the opening audio of short replies.
+        audio_service_.ResetDecoder();
+        xiaoclaw_ws_client_->ResetTtsStats();
+        SetDeviceState(kDeviceStateSynthesizing);
+    });
+
+    xiaoclaw_ws_client_->OnTtsEnd([this]() {
+        auto s = GetDeviceState();
+        if (s == kDeviceStateSpeaking || s == kDeviceStateSynthesizing) {
+            ESP_LOGI(TAG, "XiaoClaw tts_end -> idle");
+            SetDeviceState(kDeviceStateIdle);
+        }
+    });
+
+    xiaoclaw_ws_client_->OnError([this]() {
+        ESP_LOGW(TAG, "XiaoClaw server error -> error");
+        Display* display = Board::GetInstance().GetDisplay();
+        display->SetStatus("error");
+        SetDeviceState(kDeviceStateError);
+    });
+
+    xiaoclaw_ws_client_->SetOpusFrameCallback([this](const uint8_t* data, size_t len) {
+        this->OnOpusFrameFromAudio(data, len);
+    });
+
+    xiaoclaw_ws_client_->SetTtsBinaryCallback([this](const uint8_t* data, size_t len) {
+        this->OnTtsBinaryFrame(data, len);
+    });
+
+    if (!xiaoclaw_ws_client_->Start()) {
+        ESP_LOGE(TAG, "XiaoClaw WS start failed");
+        Display* display = Board::GetInstance().GetDisplay();
+        display->SetStatus("reconnecting");
+        SetDeviceState(kDeviceStateReconnecting);
+        xiaoclaw_ws_client_.reset();
+        xiaoclaw_reconnect_delay_ms_ = std::min(xiaoclaw_reconnect_delay_ms_ * 2, 30000);
+        StartXiaoClawReconnectTimer();
+    }
+}
+
+void Application::StartXiaoClawReconnectTimer() {
+    if (xiaoclaw_reconnect_timer_ == nullptr) {
+        return;
+    }
+
+    esp_timer_stop(xiaoclaw_reconnect_timer_);
+    ESP_LOGW(TAG, "XiaoClaw reconnect scheduled in %d ms", xiaoclaw_reconnect_delay_ms_);
+    esp_timer_start_once(xiaoclaw_reconnect_timer_, xiaoclaw_reconnect_delay_ms_ * 1000);
+}
+
+void Application::TryXiaoClawReconnect() {
+    if (!xiaoclaw_ws_client_) {
+        InitializeXiaoClawWsClient();
+        return;
+    }
+
+    if (xiaoclaw_ws_client_->IsConnected()) {
+        xiaoclaw_reconnect_delay_ms_ = 2000;
+        return;
+    }
+
+    ESP_LOGW(TAG, "Trying XiaoClaw WS reconnect");
+
+    xiaoclaw_reconnect_in_progress_ = true;
+    xiaoclaw_ws_client_->Stop();
+    xiaoclaw_reconnect_in_progress_ = false;
+
+    bool ok = xiaoclaw_ws_client_->Start();
+    if (!ok) {
+        xiaoclaw_reconnect_delay_ms_ = std::min(xiaoclaw_reconnect_delay_ms_ * 2, 30000);
+        StartXiaoClawReconnectTimer();
+    }
 }
 
 void Application::ActivationTask() {
@@ -337,6 +565,10 @@ void Application::ActivationTask() {
 
     // Check for new firmware version
     CheckNewVersion();
+    if (GetDeviceState() == kDeviceStateWifiConfiguring) {
+        ESP_LOGI(TAG, "Activation paused for WiFi configuration");
+        return;
+    }
 
     // Initialize the protocol
     InitializeProtocol();
@@ -404,6 +636,10 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
+#ifdef CONFIG_XIAOZHI_SKIP_OTA_VERSION_CHECK
+    ESP_LOGW(TAG, "OTA version check skipped by config");
+    return;
+#endif
     const int MAX_RETRY = 10;
     int retry_count = 0;
     int retry_delay = 10; // Initial retry delay in seconds
@@ -430,6 +666,10 @@ void Application::CheckNewVersion() {
             ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
             for (int i = 0; i < retry_delay; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
+                if (GetDeviceState() == kDeviceStateWifiConfiguring) {
+                    ESP_LOGI(TAG, "Abort version check for WiFi configuration");
+                    return;
+                }
                 if (GetDeviceState() == kDeviceStateIdle) {
                     break;
                 }
@@ -530,56 +770,13 @@ void Application::InitializeProtocol() {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (strcmp(type->valuestring, "tts_response") == 0) {
-            auto state = cJSON_GetObjectItem(root, "state");
-            if (state && cJSON_IsString(state)) {
-                if (strcmp(state->valuestring, "start") == 0) {
-                    Schedule([this]() {
-                        aborted_ = false;
-                        SetDeviceState(kDeviceStateSpeaking);
-                    });
-                } else if (strcmp(state->valuestring, "stop") == 0) {
-                    Schedule([this]() {
-                        if (GetDeviceState() == kDeviceStateSpeaking) {
-                            if (listening_mode_ == kListeningModeManualStop) {
-                                SetDeviceState(kDeviceStateIdle);
-                            } else {
-                                SetDeviceState(kDeviceStateListening);
-                            }
-                        }
-                    });
-                } else if (strcmp(state->valuestring, "sentence_start") == 0) {
-                    auto text = cJSON_GetObjectItem(root, "text");
-                    if (cJSON_IsString(text)) {
-                        ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    }
-                }
-            }
-            // Handle audio data from backend TTS
-            auto audio = cJSON_GetObjectItem(root, "audio");
-            if (cJSON_IsString(audio) && audio->valuestring) {
-                size_t audio_len = strlen(audio->valuestring);
-                size_t decoded_len = (audio_len * 3) / 4 + 1;
-                std::vector<uint8_t> decoded(decoded_len);
-
-                int ret = mbedtls_base64_decode(decoded.data(), decoded_len, &decoded_len,
-                    (const unsigned char*)audio->valuestring, audio_len);
-                if (ret == 0 && decoded_len > 0) {
-                    decoded.resize(decoded_len);
-                    audio_service_.PlayOpusData(decoded);
-                    ESP_LOGD(TAG, "Playing TTS audio: %zu bytes", decoded_len);
-                } else {
-                    ESP_LOGE(TAG, "Failed to decode base64 audio, ret=%d", ret);
-                }
-            }
+            ESP_LOGW(TAG, "Deprecated tts_response ignored; XiaoClaw requires JSON control plus binary Opus TTS");
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
                 Schedule([display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
-                    bridge_send_to_agent(message.c_str());
-                    // Show "thinking" message immediately after sending to Agent
-                    display->SetChatMessage("assistant", "思考中...");
                 });
             }
         } else if (strcmp(type->valuestring, "mcp") == 0) {
@@ -629,10 +826,6 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->Start();
-
-    // Initialize Mimiclaw Agent engine after protocol is started
-    // This allows local Agent processing alongside the server connection
-    InitializeMimiclaw();
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -697,6 +890,183 @@ void Application::StopListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
 }
 
+bool Application::IsXiaoClawWsReady() const {
+    return xiaoclaw_ws_client_ && xiaoclaw_ws_client_->IsConnected();
+}
+
+bool Application::XiaoClawSendListenStart(ListeningMode mode) {
+    if (IsXiaoClawWsReady()) {
+        return xiaoclaw_ws_client_->SendListenStartJson(mode);
+    }
+    return false;
+}
+
+bool Application::XiaoClawSendListenStop() {
+    if (IsXiaoClawWsReady()) {
+        return xiaoclaw_ws_client_->SendListenStopJson();
+    }
+    return false;
+}
+
+bool Application::XiaoClawSendWakeWordDetected(const std::string& wake_word) {
+    if (IsXiaoClawWsReady()) {
+        return xiaoclaw_ws_client_->SendWakeWordDetectedJson(wake_word);
+    }
+    return false;
+}
+
+bool Application::XiaoClawBeginListening(ListeningMode mode) {
+    if (!XiaoClawSendListenStart(mode)) {
+        ESP_LOGE(TAG, "XiaoClaw listen start failed mode=%d", static_cast<int>(mode));
+        return false;
+    }
+    if (!XiaoClawStartAudioUpload()) {
+        ESP_LOGE(TAG, "XiaoClaw audio upload start failed mode=%d", static_cast<int>(mode));
+        XiaoClawSendListenStop();
+        return false;
+    }
+    return true;
+}
+
+bool Application::XiaoClawStartAudioUpload() {
+    if (!IsXiaoClawWsReady()) {
+        ESP_LOGW(TAG, "XiaoClaw audio upload not started: ws not connected");
+        return false;
+    }
+
+    xiaoclaw_ws_client_->ResetUploadStats();
+    xiaoclaw_ws_client_->SetUploadingEnabled(true);
+
+    audio_service_.EnableWakeWordDetection(false);
+    audio_service_.EnableVoiceProcessing(true);
+
+    ESP_LOGI(TAG, "XiaoClaw audio upload started");
+    return true;
+}
+
+void Application::XiaoClawStopAudioUpload() {
+    if (xiaoclaw_ws_client_) {
+        xiaoclaw_ws_client_->SetUploadingEnabled(false);
+    }
+
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(false);
+
+    ESP_LOGI(TAG, "XiaoClaw audio upload stopped");
+}
+
+void Application::XiaoClawAbortCurrentPlayback() {
+    DeviceState state = GetDeviceState();
+    bool sent = false;
+    if (xiaoclaw_ws_client_ && xiaoclaw_ws_client_->IsConnected()) {
+        sent = xiaoclaw_ws_client_->SendAbortMessage();
+    }
+    audio_service_.ClearPlaybackQueues();
+    SetDeviceState(kDeviceStateIdle);
+    ESP_LOGI(TAG, "BOOT abort playback state=%s sent_abort=%d",
+             DeviceStateMachine::GetStateName(state), sent ? 1 : 0);
+}
+
+void Application::OnOpusFrameFromAudio(const uint8_t* data, size_t len) {
+    static uint32_t opus_cb_total = 0;
+    static uint32_t opus_drop_bad_state = 0;
+    static uint32_t opus_drop_no_ws = 0;
+    static uint32_t opus_drop_upload_disabled = 0;
+    ++opus_cb_total;
+
+    auto state = GetDeviceState();
+    if (state != kDeviceStateListening && state != kDeviceStateUploadingAudio) {
+        ++opus_drop_bad_state;
+        if (opus_drop_bad_state == 1 || (opus_drop_bad_state % 50) == 0) {
+            ESP_LOGW(TAG,
+                     "opus cb drop[%u] bad_state=%s total_cb=%u",
+                     static_cast<unsigned>(opus_drop_bad_state),
+                     DeviceStateMachine::GetStateName(state),
+                     static_cast<unsigned>(opus_cb_total));
+        }
+        return;
+    }
+    if (!data || len == 0 || len > 2048) {
+        return;
+    }
+    if (!xiaoclaw_ws_client_ || !xiaoclaw_ws_client_->IsConnected()) {
+        ++opus_drop_no_ws;
+        if (opus_drop_no_ws == 1 || (opus_drop_no_ws % 50) == 0) {
+            ESP_LOGW(TAG,
+                     "opus cb drop[%u] no_ws total_cb=%u",
+                     static_cast<unsigned>(opus_drop_no_ws),
+                     static_cast<unsigned>(opus_cb_total));
+        }
+        return;
+    }
+    if (!xiaoclaw_ws_client_->IsUploadingEnabled()) {
+        ++opus_drop_upload_disabled;
+        if (opus_drop_upload_disabled == 1 || (opus_drop_upload_disabled % 50) == 0) {
+            ESP_LOGW(TAG,
+                     "opus cb drop[%u] upload_disabled total_cb=%u",
+                     static_cast<unsigned>(opus_drop_upload_disabled),
+                     static_cast<unsigned>(opus_cb_total));
+        }
+        return;
+    }
+
+    if ((opus_cb_total % 25) == 1) {
+        ESP_LOGI(TAG,
+                 "opus cb OK count=%u len=%u upload_en=%d state=%s",
+                 static_cast<unsigned>(opus_cb_total),
+                 static_cast<unsigned>(len),
+                 xiaoclaw_ws_client_->IsUploadingEnabled(),
+                 DeviceStateMachine::GetStateName(state));
+    }
+
+    if (state == kDeviceStateListening) {
+        SetDeviceState(kDeviceStateUploadingAudio);
+    }
+
+    xiaoclaw_ws_client_->SendOpusFrame(data, len);
+}
+
+void Application::OnTtsBinaryFrame(const uint8_t* data, size_t len) {
+    static uint32_t tts_drop_bad_state = 0;
+    ++tts_drop_bad_state;
+
+    auto state = GetDeviceState();
+    if (state != kDeviceStateSynthesizing && state != kDeviceStateSpeaking) {
+        if (tts_drop_bad_state == 1 || (tts_drop_bad_state % 25) == 0) {
+            ESP_LOGW(TAG,
+                     "tts binary drop[%u] bad_state=%s",
+                     static_cast<unsigned>(tts_drop_bad_state),
+                     DeviceStateMachine::GetStateName(state));
+        }
+        return;
+    }
+    if (!data || len == 0 || len > 2048) {
+        return;
+    }
+
+    if (state == kDeviceStateSynthesizing) {
+        SetDeviceState(kDeviceStateSpeaking);
+    }
+
+    audio_service_.PlayTtsBinaryFrame(data, len, 24000, 60);
+}
+
+void Application::StartRecognizingTimeout() {
+    if (xiaoclaw_recognizing_timeout_timer_ == nullptr) {
+        return;
+    }
+    esp_timer_stop(xiaoclaw_recognizing_timeout_timer_);
+    esp_timer_start_once(xiaoclaw_recognizing_timeout_timer_, 10000000);
+    ESP_LOGI(TAG, "recognizing timeout started (10s)");
+}
+
+void Application::CancelRecognizingTimeout() {
+    if (xiaoclaw_recognizing_timeout_timer_ == nullptr) {
+        return;
+    }
+    esp_timer_stop(xiaoclaw_recognizing_timeout_timer_);
+}
+
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
     
@@ -713,13 +1083,16 @@ void Application::HandleToggleChatEvent() {
         return;
     }
 
-    if (!protocol_) {
-        ESP_LOGE(TAG, "Protocol not initialized");
-        return;
-    }
-
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
+        if (IsXiaoClawWsReady()) {
+            SetListeningMode(mode);
+            return;
+        }
+        if (!protocol_) {
+            ESP_LOGE(TAG, "Protocol not initialized");
+            return;
+        }
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -730,17 +1103,36 @@ void Application::HandleToggleChatEvent() {
         }
         SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
-        AbortSpeaking(kAbortReasonNone);
+        // Send abort to stop server-side TTS without ending dialogue session
+        if (xiaoclaw_ws_client_ && xiaoclaw_ws_client_->IsConnected()) {
+            xiaoclaw_ws_client_->SendAbortMessage();
+        } else {
+            AbortSpeaking(kAbortReasonNone);
+        }
         // Clear playback queues to stop TTS immediately
         audio_service_.ClearPlaybackQueues();
+        SetDeviceState(kDeviceStateIdle);
     } else if (state == kDeviceStateListening) {
-        protocol_->CloseAudioChannel();
+        if (IsXiaoClawWsReady()) {
+            XiaoClawStopAudioUpload();
+            XiaoClawSendListenStop();
+            SetDeviceState(kDeviceStateRecognizing);
+            return;
+        }
+        if (protocol_) {
+            protocol_->CloseAudioChannel();
+        }
     }
 }
 
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
+        return;
+    }
+
+    if (IsXiaoClawWsReady()) {
+        SetListeningMode(mode);
         return;
     }
 
@@ -765,12 +1157,15 @@ void Application::HandleStartListeningEvent() {
         return;
     }
 
-    if (!protocol_) {
-        ESP_LOGE(TAG, "Protocol not initialized");
-        return;
-    }
-    
     if (state == kDeviceStateIdle) {
+        if (IsXiaoClawWsReady()) {
+            SetListeningMode(kListeningModeManualStop);
+            return;
+        }
+        if (!protocol_) {
+            ESP_LOGE(TAG, "Protocol not initialized");
+            return;
+        }
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -794,25 +1189,45 @@ void Application::HandleStopListeningEvent() {
         SetDeviceState(kDeviceStateWifiConfiguring);
         return;
     } else if (state == kDeviceStateListening) {
+        if (IsXiaoClawWsReady()) {
+            XiaoClawStopAudioUpload();
+            XiaoClawSendListenStop();
+            SetDeviceState(kDeviceStateRecognizing);
+            return;
+        }
         if (protocol_) {
             protocol_->SendStopListening();
+            SetDeviceState(kDeviceStateIdle);
         }
-        SetDeviceState(kDeviceStateIdle);
     }
 }
 
 void Application::HandleWakeWordDetectedEvent() {
-    if (!protocol_) {
+    auto state = GetDeviceState();
+
+    // Cooldown: ignore if we detected a wake word in the last 2 seconds
+    // Prevents double-detection from AFE residual buffer.
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms - last_wake_word_time_ms_ < 2000) {
+        ESP_LOGI(TAG, "Wake word ignored (cooldown, %lld ms since last)",
+                 (long long)(now_ms - last_wake_word_time_ms_));
+        return;
+    }
+    last_wake_word_time_ms_ = now_ms;
+
+    if (!protocol_ && !IsXiaoClawWsReady()) {
         return;
     }
 
-    auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();
-    ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+    ESP_LOGI(TAG, "Wake word detected: '%s' (state=%s)",
+             wake_word.c_str(), DeviceStateMachine::GetStateName(state));
 
     if (state == kDeviceStateIdle) {
-        audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
+        if (!IsXiaoClawWsReady()) {
+            audio_service_.EncodeWakeWord();
+        }
 
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
@@ -833,7 +1248,14 @@ void Application::HandleWakeWordDetectedEvent() {
         audio_service_.ClearPlaybackQueues();
 
         if (state == kDeviceStateListening) {
-            protocol_->SendStartListening(GetDefaultListeningMode());
+            if (IsXiaoClawWsReady()) {
+                if (!XiaoClawBeginListening(GetDefaultListeningMode())) {
+                    SetDeviceState(kDeviceStateError);
+                    return;
+                }
+            } else {
+                protocol_->SendStartListening(GetDefaultListeningMode());
+            }
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             // Re-enable wake word detection as it was stopped by the detection itself
@@ -850,36 +1272,64 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
-    // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting) {
+    auto state = GetDeviceState();
+
+    // 允许从 idle / connecting / wakeup_detected 继续
+    if (state != kDeviceStateConnecting &&
+        state != kDeviceStateIdle &&
+        state != kDeviceStateWakeupDetected) {
+        return;
+    }
+
+    if (IsXiaoClawWsReady()) {
+        if (GetDeviceState() == kDeviceStateIdle ||
+            GetDeviceState() == kDeviceStateConnecting) {
+            SetDeviceState(kDeviceStateWakeupDetected);
+        }
+
+        ESP_LOGI(TAG, "Wake word detected (XiaoClaw WS): %s", wake_word.c_str());
+        // For wake-then-speak UX, do not feed the wake word itself into the
+        // next ASR round; wait for the follow-up question after the prompt.
+        audio_service_.DiscardPreWakeAudioOnNextFlush();
+
+#if CONFIG_SEND_WAKE_WORD_DATA
+        if (!XiaoClawSendWakeWordDetected(wake_word)) {
+            audio_service_.EnableWakeWordDetection(true);
+            SetDeviceState(kDeviceStateIdle);
+            return;
+        }
+#endif
+
+        play_popup_on_listening_ = true;
+        SetListeningMode(GetDefaultListeningMode());
         return;
     }
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
             audio_service_.EnableWakeWordDetection(true);
+            SetDeviceState(kDeviceStateIdle);
             return;
         }
     }
 
+    // 本地先明确进入 wakeup_detected，保证状态机和 TFT 口径一致
+    if (GetDeviceState() == kDeviceStateIdle ||
+        GetDeviceState() == kDeviceStateConnecting) {
+        SetDeviceState(kDeviceStateWakeupDetected);
+    }
+
     ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
+
 #if CONFIG_SEND_WAKE_WORD_DATA
-    // Encode and send the wake word data to the server
     while (auto packet = audio_service_.PopWakeWordPacket()) {
         protocol_->SendAudio(std::move(packet));
     }
-    // Set the chat state to wake word detected
     protocol_->SendWakeWordDetected(wake_word);
-
-    // Set flag to play popup sound after state changes to listening
-    play_popup_on_listening_ = true;
-    SetListeningMode(GetDefaultListeningMode());
-#else
-    // Set flag to play popup sound after state changes to listening
-    // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
-    play_popup_on_listening_ = true;
-    SetListeningMode(GetDefaultListeningMode());
 #endif
+
+    play_popup_on_listening_ = true;
+    SetListeningMode(GetDefaultListeningMode());
 }
 
 void Application::HandleStateChangedEvent() {
@@ -894,53 +1344,66 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;
+        case kDeviceStateWakeupDetected:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+            display->SetStatus("wakeup");
+            display->SetEmotion("neutral");
+            break;
         case kDeviceStateConnecting:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             display->SetStatus(Lang::Strings::CONNECTING);
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
-            // Make sure the audio processor is running
-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // Wait for playback queue to be empty before enabling voice processing
-                // This prevents audio truncation when STOP arrives late due to network jitter
-                audio_service_.WaitForPlaybackQueueEmpty();
-
-                // Send the start listening command
-                protocol_->SendStartListening(listening_mode_);
-                audio_service_.EnableVoiceProcessing(true);
+            if (xiaoclaw_boot_listening_) {
+                audio_service_.EnableWakeWordDetection(false);
+                if (!audio_service_.IsAudioProcessorRunning()) {
+                    audio_service_.EnableVoiceProcessing(true);
+                }
+                break;
             }
 
-#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
-            // Enable wake word detection in listening mode (configured via Kconfig)
-            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
-#else
-            // Disable wake word detection in listening mode
+            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
+                audio_service_.WaitForPlaybackQueueEmpty();
+                if (IsXiaoClawWsReady()) {
+                    if (!XiaoClawBeginListening(listening_mode_)) {
+                        SetDeviceState(kDeviceStateError);
+                        break;
+                    }
+                } else if (protocol_) {
+                    protocol_->SendStartListening(listening_mode_);
+                    audio_service_.EnableVoiceProcessing(true);
+                }
+            }
+
             audio_service_.EnableWakeWordDetection(false);
-#endif
-            
-            // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
+
             if (play_popup_on_listening_) {
                 play_popup_on_listening_ = false;
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             }
             break;
         case kDeviceStateThinking:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             display->SetStatus(Lang::Strings::THINKING);
             display->SetEmotion("microchip_ai");
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(false);
             break;
         case kDeviceStateSpeaking:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             display->SetStatus(Lang::Strings::SPEAKING);
 
             if (listening_mode_ != kListeningModeRealtime) {
@@ -948,7 +1411,13 @@ void Application::HandleStateChangedEvent() {
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            audio_service_.ResetDecoder();
+            break;
+        case kDeviceStateError:
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            display->SetStatus("error");
+            display->SetEmotion("neutral");
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.EnableWakeWordDetection(false);
             break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);
@@ -1051,7 +1520,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
-    if (!protocol_) {
+    if (!protocol_ && !IsXiaoClawWsReady()) {
         return;
     }
 
@@ -1059,6 +1528,14 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     
     if (state == kDeviceStateIdle) {
         audio_service_.EncodeWakeWord();
+
+        if (IsXiaoClawWsReady()) {
+            SetDeviceState(kDeviceStateConnecting);
+            Schedule([this, wake_word]() {
+                ContinueWakeWordInvoke(wake_word);
+            });
+            return;
+        }
 
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
@@ -1083,10 +1560,14 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         });
     } else if (state == kDeviceStateListening) {
         Schedule([this]() {
-            if (protocol_) {
+            if (IsXiaoClawWsReady()) {
+                XiaoClawStopAudioUpload();
+                XiaoClawSendListenStop();
+                SetDeviceState(kDeviceStateRecognizing);
+            } else if (protocol_) {
                 protocol_->CloseAudioChannel();
+                SetDeviceState(kDeviceStateIdle);
             }
-            SetDeviceState(kDeviceStateIdle);
         });
     }
 }
@@ -1158,98 +1639,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-
-// ==================== Mimiclaw Agent Integration ====================
-
-void Application::OnAgentResponseCallback(const char* text) {
-    GetInstance().HandleAgentResponse(std::string(text ? text : ""));
-}
-
-void Application::InitializeMimiclaw() {
-    ESP_LOGI(TAG, "Initializing Mimiclaw Agent engine...");
-
-    // Initialize mimiclaw core subsystems
-    esp_err_t err = mimiclaw_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize Mimiclaw: %s", esp_err_to_name(err));
-        return;
-    }
-
-    // Initialize Bridge layer
-    err = bridge_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize Bridge: %s", esp_err_to_name(err));
-        return;
-    }
-
-    // Register callback for Agent responses
-    bridge_set_response_callback(OnAgentResponseCallback);
-
-    // Start Bridge task
-    err = bridge_start();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start Bridge task: %s", esp_err_to_name(err));
-        return;
-    }
-
-    ESP_LOGI(TAG, "Mimiclaw Agent engine initialized successfully");
-}
-
-void Application::HandleAgentResponse(const std::string& text) {
-    ESP_LOGI(TAG, "Agent response: %.100s...", text.c_str());
-
-    // Skip TTS for working status messages, enter thinking state instead
-    if (text.rfind("思考中", 0) == 0) {
-        ESP_LOGI(TAG, "Entering thinking state");
-        Schedule([this]() {
-            SetDeviceState(kDeviceStateThinking);
-        });
-        return;
-    }
-
-    // Schedule in main task context
-    Schedule([this, text]() {
-        // Check if protocol is still valid (may have been reset)
-        if (!protocol_) {
-            ESP_LOGW(TAG, "Protocol not available, cannot send TTS request");
-            return;
-        }
-
-        // Update display with Agent response
-        auto display = Board::GetInstance().GetDisplay();
-        display->SetChatMessage("assistant", text.c_str());
-
-        // Debug: Check protocol connection state before sending TTS request
-        bool channel_opened = protocol_->IsAudioChannelOpened();
-        ESP_LOGI(TAG, "Protocol state: IsAudioChannelOpened=%d", channel_opened ? 1 : 0);
-
-        // If audio channel is not opened, try to open it first
-        if (!channel_opened) {
-            ESP_LOGI(TAG, "Audio channel not opened, attempting to reopen for TTS...");
-            if (!protocol_->OpenAudioChannel()) {
-                ESP_LOGE(TAG, "Failed to reopen audio channel for TTS");
-                return;
-            }
-            ESP_LOGI(TAG, "Audio channel reopened successfully");
-        }
-
-        // Send TTS request to backend
-        cJSON *root = cJSON_CreateObject();
-        cJSON_AddStringToObject(root, "type", "tts_request");
-        cJSON_AddStringToObject(root, "text", text.c_str());
-        char *json_str = cJSON_PrintUnformatted(root);
-        if (json_str) {
-            ESP_LOGI(TAG, "Sending TTS request: %.100s...", json_str);
-            if (!protocol_->SendText(json_str)) {
-                ESP_LOGE(TAG, "Failed to send TTS request");
-            } else {
-                ESP_LOGI(TAG, "TTS request sent successfully");
-            }
-            free(json_str);
-        }
-        cJSON_Delete(root);
-
-        ESP_LOGI(TAG, "Displayed Agent response: %.60s...", text.c_str());
-    });
-}
-

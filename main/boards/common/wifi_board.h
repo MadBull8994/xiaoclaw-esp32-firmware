@@ -5,10 +5,12 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <esp_timer.h>
+#include <esp_http_server.h>
 
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
+    httpd_handle_t openclaw_config_server_ = nullptr;
     bool in_config_mode_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
 
@@ -30,6 +32,8 @@ protected:
      * Enter WiFi configuration mode
      */
     void StartWifiConfigMode();
+    void StartOpenClawConfigServer();
+    void StopOpenClawConfigServer();
 
     /**
      * WiFi connection timeout callback

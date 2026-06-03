@@ -10,9 +10,11 @@ sdkconfig
 dependencies.lock
 .env
 releases/
+build-openclaw-verify/
 main/assets/lang_config.h
 main/mmap_generate_emoji.h
 .DS_Store
+.omx/
 .cache
 *.pyc
 *.bin
@@ -21,3 +23,5 @@ mmap_generate_*.h
 debug/
 examples/
 sdkconfig
+sdkconfig.bak
+sdkconfig.fixed

@@ -83,6 +83,15 @@ static void safe_copy(char *dst, size_t dst_size, const char *src)
     dst[n] = '\0';
 }
 
+static char *llm_alloc_temp(size_t size)
+{
+    char *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return buf;
+}
+
 /* ── Response buffer ──────────────────────────────────────────── */
 
 typedef struct {
@@ -323,6 +332,14 @@ esp_err_t llm_proxy_init(void)
         nvs_close(nvs);
     }
 
+    /* DeepSeek API requires /v1 prefix. Fix common misconfiguration. */
+    if (strstr(s_openai_api_url, "api.deepseek.com") &&
+        !strstr(s_openai_api_url, "/v1/")) {
+        safe_copy(s_openai_api_url, sizeof(s_openai_api_url),
+                  "https://api.deepseek.com/v1/chat/completions");
+        ESP_LOGI(TAG, "DeepSeek URL fixed: %s", s_openai_api_url);
+    }
+
     if (s_api_key[0]) {
         ESP_LOGI(TAG, "LLM proxy initialized (provider: %s, model: %s)", s_provider, s_model);
         if (s_anthropic_api_url[0]) {
@@ -382,10 +399,14 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
     if (!conn) return ESP_ERR_HTTP_CONNECT;
 
     int body_len = strlen(post_data);
-    char header[1024];
+    char *header = llm_alloc_temp(1024);
+    if (!header) {
+        proxy_conn_close(conn);
+        return ESP_ERR_NO_MEM;
+    }
     int hlen = 0;
     if (provider_is_openai()) {
-        hlen = snprintf(header, sizeof(header),
+        hlen = snprintf(header, 1024,
             "POST %s HTTP/1.1\r\n"
             "Host: %s\r\n"
             "Content-Type: application/json\r\n"
@@ -394,7 +415,7 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
             "Connection: close\r\n\r\n",
             llm_api_path(), llm_api_host(), s_api_key, body_len);
     } else {
-        hlen = snprintf(header, sizeof(header),
+        hlen = snprintf(header, 1024,
             "POST %s HTTP/1.1\r\n"
             "Host: %s\r\n"
             "Content-Type: application/json\r\n"
@@ -404,20 +425,32 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
             "Connection: close\r\n\r\n",
             llm_api_path(), llm_api_host(), s_api_key, MIMI_LLM_API_VERSION, body_len);
     }
+    if (hlen < 0 || hlen >= 1024) {
+        free(header);
+        proxy_conn_close(conn);
+        return ESP_FAIL;
+    }
 
     if (proxy_conn_write(conn, header, hlen) < 0 ||
         proxy_conn_write(conn, post_data, body_len) < 0) {
+        free(header);
         proxy_conn_close(conn);
         return ESP_ERR_HTTP_WRITE_DATA;
     }
+    free(header);
 
     /* Read full response into buffer */
-    char tmp[4096];
+    char *tmp = llm_alloc_temp(4096);
+    if (!tmp) {
+        proxy_conn_close(conn);
+        return ESP_ERR_NO_MEM;
+    }
     while (1) {
-        int n = proxy_conn_read(conn, tmp, sizeof(tmp), 120000);
+        int n = proxy_conn_read(conn, tmp, 4096, 120000);
         if (n <= 0) break;
         if (resp_buf_append(rb, tmp, n) != ESP_OK) break;
     }
+    free(tmp);
     proxy_conn_close(conn);
 
     /* Parse status line */

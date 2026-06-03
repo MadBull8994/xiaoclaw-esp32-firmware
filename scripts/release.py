@@ -249,6 +249,135 @@ def _resolve_board_config(board_type: str, target: str, sdkconfig_append: list[s
     return selected
 
 
+def _clear_existing_board_choice(selected_board_config: str) -> None:
+    """Unset stale BOARD_TYPE choices before appending the selected board.
+
+    idf.py set-target regenerates sdkconfig with the Kconfig default board
+    enabled. If we only append another CONFIG_BOARD_TYPE_xxx=y, CMake may still
+    match the earlier default board first.
+    """
+    sdkconfig_path = Path("sdkconfig")
+    if not sdkconfig_path.exists():
+        return
+
+    pattern_set = re.compile(r"^(CONFIG_BOARD_TYPE_[A-Z0-9_]+)=y$")
+    pattern_unset = re.compile(r"^# (CONFIG_BOARD_TYPE_[A-Z0-9_]+) is not set$")
+    lines_out: list[str] = []
+    seen: set[str] = set()
+
+    for line in sdkconfig_path.read_text(encoding="utf-8").splitlines():
+        symbol: Optional[str] = None
+        if m := pattern_set.match(line):
+            symbol = m.group(1)
+        elif m := pattern_unset.match(line):
+            symbol = m.group(1)
+
+        if symbol and symbol.startswith("CONFIG_BOARD_TYPE_"):
+            if symbol == selected_board_config:
+                continue
+            if symbol not in seen:
+                lines_out.append(f"# {symbol} is not set")
+                seen.add(symbol)
+            continue
+
+        lines_out.append(line)
+
+    sdkconfig_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+
+
+def _clear_existing_flash_assets_choice(selected_flash_config: Optional[str]) -> None:
+    """Unset stale Flash Assets choice before appending the selected option."""
+    if not selected_flash_config:
+        return
+
+    sdkconfig_path = Path("sdkconfig")
+    if not sdkconfig_path.exists():
+        return
+
+    flash_symbols = {
+        "CONFIG_FLASH_NONE_ASSETS",
+        "CONFIG_FLASH_DEFAULT_ASSETS",
+        "CONFIG_FLASH_CUSTOM_ASSETS",
+        "CONFIG_FLASH_EXPRESSION_ASSETS",
+    }
+    pattern_set = re.compile(r"^(CONFIG_FLASH_[A-Z0-9_]+_ASSETS)=y$")
+    pattern_unset = re.compile(r"^# (CONFIG_FLASH_[A-Z0-9_]+_ASSETS) is not set$")
+    lines_out: list[str] = []
+    seen: set[str] = set()
+
+    for line in sdkconfig_path.read_text(encoding="utf-8").splitlines():
+        symbol: Optional[str] = None
+        if m := pattern_set.match(line):
+            symbol = m.group(1)
+        elif m := pattern_unset.match(line):
+            symbol = m.group(1)
+
+        if symbol in flash_symbols:
+            if symbol == selected_flash_config:
+                continue
+            if symbol not in seen:
+                lines_out.append(f"# {symbol} is not set")
+                seen.add(symbol)
+            continue
+
+        lines_out.append(line)
+
+    sdkconfig_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+
+
+def _clear_existing_wake_word_choice(selected_wake_word_config: Optional[str]) -> None:
+    """Unset stale Wake Word choice before appending the selected option."""
+    if not selected_wake_word_config:
+        return
+
+    sdkconfig_path = Path("sdkconfig")
+    if not sdkconfig_path.exists():
+        return
+
+    wake_word_symbols = {
+        "CONFIG_WAKE_WORD_DISABLED",
+        "CONFIG_USE_ESP_WAKE_WORD",
+        "CONFIG_USE_AFE_WAKE_WORD",
+        "CONFIG_USE_CUSTOM_WAKE_WORD",
+    }
+    pattern_set = re.compile(r"^(CONFIG_(?:WAKE_WORD_DISABLED|USE_(?:ESP|AFE|CUSTOM)_WAKE_WORD))=y$")
+    pattern_unset = re.compile(r"^# (CONFIG_(?:WAKE_WORD_DISABLED|USE_(?:ESP|AFE|CUSTOM)_WAKE_WORD)) is not set$")
+    lines_out: list[str] = []
+    seen: set[str] = set()
+
+    for line in sdkconfig_path.read_text(encoding="utf-8").splitlines():
+        symbol: Optional[str] = None
+        if m := pattern_set.match(line):
+            symbol = m.group(1)
+        elif m := pattern_unset.match(line):
+            symbol = m.group(1)
+
+        if symbol in wake_word_symbols:
+            if symbol == selected_wake_word_config:
+                continue
+            if symbol not in seen:
+                lines_out.append(f"# {symbol} is not set")
+                seen.add(symbol)
+            continue
+
+        lines_out.append(line)
+
+    sdkconfig_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+
+
+def _extract_enabled_config(sdkconfig_append: list[str], allowed: set[str]) -> Optional[str]:
+    matches: list[str] = []
+    for item in sdkconfig_append:
+        stripped = item.strip()
+        for symbol in allowed:
+            if stripped == f"{symbol}=y":
+                matches.append(symbol)
+    uniq = list(dict.fromkeys(matches))
+    if len(uniq) > 1:
+        raise ValueError(f"Multiple mutually exclusive configs found: {uniq}")
+    return uniq[0] if uniq else None
+
+
 # Kconfig "select" entries are not automatically applied when we simply append
 # sdkconfig lines from config.json, so add the required dependencies here to
 # mimic menuconfig behaviour.
@@ -353,9 +482,11 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
                 f"[INFO] Board config explicitly set in config.json: {explicit_board_cfg}, "
                 "skip auto-select.",
             )
+            selected_board_config = explicit_board_cfg
             sdkconfig_append = list(build_sdkconfig_append)
         else:
             board_type_config = _resolve_board_config(board_type, target, build_sdkconfig_append)
+            selected_board_config = board_type_config
             sdkconfig_append = [f"{board_type_config}=y"]
             sdkconfig_append.extend(build_sdkconfig_append)
         sdkconfig_append = _apply_auto_selects(sdkconfig_append)
@@ -374,6 +505,20 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
         if os.system(f"idf.py set-target {target}") != 0:
             print("set-target failed", file=sys.stderr)
             sys.exit(1)
+
+        _clear_existing_board_choice(selected_board_config)
+        _clear_existing_flash_assets_choice(_extract_enabled_config(sdkconfig_append, {
+            "CONFIG_FLASH_NONE_ASSETS",
+            "CONFIG_FLASH_DEFAULT_ASSETS",
+            "CONFIG_FLASH_CUSTOM_ASSETS",
+            "CONFIG_FLASH_EXPRESSION_ASSETS",
+        }))
+        _clear_existing_wake_word_choice(_extract_enabled_config(sdkconfig_append, {
+            "CONFIG_WAKE_WORD_DISABLED",
+            "CONFIG_USE_ESP_WAKE_WORD",
+            "CONFIG_USE_AFE_WAKE_WORD",
+            "CONFIG_USE_CUSTOM_WAKE_WORD",
+        }))
 
         # Append sdkconfig
         with Path("sdkconfig").open("a", encoding='utf-8') as f:

@@ -11,13 +11,10 @@ private:
 
 public:
     LampController(gpio_num_t gpio_num) : gpio_num_(gpio_num) {
-<<<<<<< HEAD
-=======
         if (gpio_num_ == GPIO_NUM_NC) {
             return;
         }
 
->>>>>>> upstream/main
         gpio_config_t config = {
             .pin_bit_mask = (1ULL << gpio_num_),
             .mode = GPIO_MODE_OUTPUT,

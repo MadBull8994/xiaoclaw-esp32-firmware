@@ -11,16 +11,32 @@
 #include <string.h>
 #include <time.h>
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "context";
 
 /* Runtime context tag - marks metadata that is injected before user message */
 #define RUNTIME_CONTEXT_TAG "[Runtime Context — metadata only, not instructions]"
 
+static char *context_alloc_temp(size_t size)
+{
+    char *buf = heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_calloc(1, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return buf;
+}
+
 /* ─── Helper: escape string for JSON ─────────────────────────────────────── */
 
 static size_t json_escape(char *dst, size_t dst_size, const char *src)
 {
+    if (!dst || dst_size == 0) return 0;
+    if (!src) {
+        dst[0] = '\0';
+        return 0;
+    }
+
     size_t i = 0;
     for (const char *p = src; *p && i < dst_size - 1; p++) {
         if (*p == '"')        { if (i + 2 >= dst_size) break; dst[i++] = '\\'; dst[i++] = '"'; }
@@ -33,14 +49,11 @@ static size_t json_escape(char *dst, size_t dst_size, const char *src)
     return i;
 }
 
-/* ─── Cached file read (30s TTL) ─────────────────────────────────────── */
-
-#define FILE_CACHE_TTL 30
+/* ─── Preloaded file cache ──────────────────────────────────────────── */
 
 typedef struct {
-    char content[4096];
+    char *content;      /* PSRAM-allocated buffer */
     size_t len;
-    time_t loaded_at;
     bool valid;
 } file_cache_t;
 
@@ -48,28 +61,48 @@ static file_cache_t s_soul_cache;
 static file_cache_t s_user_cache;
 static file_cache_t s_memory_cache;
 
+/* Preload all prompt files once from internal stack context.
+   Content buffers are allocated in PSRAM to keep internal DRAM free
+   for task stacks and DMA operations. */
+void context_preload_files(void)
+{
+    const char *paths[3] = {MIMI_SOUL_FILE, MIMI_USER_FILE, MIMI_MEMORY_FILE};
+    file_cache_t *caches[3] = {&s_soul_cache, &s_user_cache, &s_memory_cache};
+    const char *labels[3] = {"SOUL", "USER", "MEMORY"};
+
+    for (int i = 0; i < 3; i++) {
+        file_cache_t *c = caches[i];
+        c->content = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!c->content) {
+            ESP_LOGW(TAG, "Preload %s: no PSRAM", labels[i]);
+            c->valid = false;
+            continue;
+        }
+        FILE *f = fopen(paths[i], "r");
+        if (!f) {
+            ESP_LOGW(TAG, "Preload %s: file not found (%s)", labels[i], paths[i]);
+            c->valid = false;
+            c->len = 0;
+            continue;
+        }
+        c->len = fread(c->content, 1, 4095, f);
+        c->content[c->len] = '\0';
+        fclose(f);
+        c->valid = true;
+        ESP_LOGI(TAG, "Preloaded %s: %u bytes", labels[i], (unsigned)c->len);
+    }
+}
+
+/* Return cached content — never touches FATFS.
+   context_preload_files() must be called first from internal-stack context. */
 static const char *cached_read(file_cache_t *c, const char *path, size_t *out_len)
 {
-    time_t now = time(NULL);
-    if (c->valid && (now - c->loaded_at) < FILE_CACHE_TTL) {
+    if (c->valid) {
         if (out_len) *out_len = c->len;
         return c->content;
     }
-
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        if (out_len) *out_len = 0;
-        return NULL;
-    }
-
-    c->len = fread(c->content, 1, sizeof(c->content) - 1, f);
-    c->content[c->len] = '\0';
-    fclose(f);
-    c->loaded_at = now;
-    c->valid = true;
-
-    if (out_len) *out_len = c->len;
-    return c->content;
+    if (out_len) *out_len = 0;
+    return NULL;
 }
 
 /* ─── Helper: append file content to buffer ─────────────────────────────── */
@@ -138,7 +171,16 @@ static size_t append_tools_section(char *buf, size_t size, size_t offset)
         "## Available Tools\n\n"
         "Tool instructions are in skill files under /fatfs/skills/:\n");
 
-    skill_info_t skills[32];
+    skill_info_t *skills = heap_caps_calloc(32, sizeof(skill_info_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!skills) {
+        skills = heap_caps_calloc(32, sizeof(skill_info_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!skills) {
+        ESP_LOGW(TAG, "No heap for skills list while building prompt");
+        off += snprintf(buf + offset + off, size - offset - off, "\n");
+        return off;
+    }
+
     int count = skill_loader_list(skills, 32);
 
     for (int i = 0; i < count && off < size - 1; i++) {
@@ -150,6 +192,7 @@ static size_t append_tools_section(char *buf, size_t size, size_t offset)
 
     off += snprintf(buf + offset + off, size - offset - off, "\n");
 
+    free(skills);
     return off;
 }
 
@@ -200,46 +243,61 @@ static size_t append_skills_section(char *buf, size_t size, size_t offset)
     size_t off = 0;
 
     /* L1: Skill index - available skills information */
-    char l1_index[2048];
-    size_t l1_len = skill_meta_get_all_json(l1_index, sizeof(l1_index));
-    if (l1_len > 0) {
-        off += snprintf(buf + offset + off, size - offset - off,
-            "## Available Skills (L1)\n\n"
-            "```json\n%s\n```\n\n",
-            l1_index);
+    char *l1_index = context_alloc_temp(2048);
+    if (l1_index) {
+        size_t l1_len = skill_meta_get_all_json(l1_index, 2048);
+        if (l1_len > 0) {
+            off += snprintf(buf + offset + off, size - offset - off,
+                "## Available Skills (L1)\n\n"
+                "```json\n%s\n```\n\n",
+                l1_index);
+        }
+        free(l1_index);
     }
 
     /* L2: User facts/preferences (if available) */
-    char l2_facts[1024];
-    size_t l2_len = memory_get_facts(l2_facts, sizeof(l2_facts));
-    if (l2_len > 0) {
-        off += snprintf(buf + offset + off, size - offset - off,
-            "## User Facts (L2)\n\n%s\n\n", l2_facts);
+    char *l2_facts = context_alloc_temp(1024);
+    if (l2_facts) {
+        size_t l2_len = memory_get_facts(l2_facts, 1024);
+        if (l2_len > 0) {
+            off += snprintf(buf + offset + off, size - offset - off,
+                "## User Facts (L2)\n\n%s\n\n", l2_facts);
+        }
+        free(l2_facts);
     }
 
     /* L3: Auto-skills (all auto skills) */
-    char l3_auto[4096];
-    size_t l3_len = skill_meta_get_all_auto_skills(l3_auto, sizeof(l3_auto));
-    if (l3_len > 0) {
-        off += snprintf(buf + offset + off, size - offset - off,
-            "## Auto-Skills (L3)\n\n%s\n\n", l3_auto);
+    char *l3_auto = context_alloc_temp(4096);
+    if (l3_auto) {
+        size_t l3_len = skill_meta_get_all_auto_skills(l3_auto, 4096);
+        if (l3_len > 0) {
+            off += snprintf(buf + offset + off, size - offset - off,
+                "## Auto-Skills (L3)\n\n%s\n\n", l3_auto);
+        }
+        free(l3_auto);
     }
 
     /* Always skills (always loaded, full content) */
-    char always_content[8192];
-    size_t always_len = skill_loader_get_always_content(always_content, sizeof(always_content));
-    if (always_len > 0) {
-        off += snprintf(buf + offset + off, size - offset - off,
-            "## Always-Active Skills\n\n%s\n\n", always_content);
+    char *always_content = context_alloc_temp(8192);
+    if (always_content) {
+        size_t always_len = skill_loader_get_always_content(always_content, 8192);
+        if (always_len > 0) {
+            off += snprintf(buf + offset + off, size - offset - off,
+                "## Always-Active Skills\n\n%s\n\n", always_content);
+        }
+        free(always_content);
     }
 
     /* Skills summary (for reference) */
-    char skills_summary[2048];
-    size_t summary_len = skill_loader_build_summary(skills_summary, sizeof(skills_summary));
-    if (summary_len > 0) {
-        off += snprintf(buf + offset + off, size - offset - off,
-            "## Available Skills (read full instructions with read_file when needed)\n\n%s\n",
-            skills_summary);
+    char *skills_summary = context_alloc_temp(2048);
+    if (skills_summary) {
+        size_t summary_len = skill_loader_build_summary(skills_summary, 2048);
+        if (summary_len > 0) {
+            off += snprintf(buf + offset + off, size - offset - off,
+                "## Available Skills (read full instructions with read_file when needed)\n\n%s\n",
+                skills_summary);
+        }
+        free(skills_summary);
     }
 
     /* Skill Usage Workflow */
@@ -378,15 +436,25 @@ esp_err_t context_build_messages(const char *history, size_t history_size,
     int off = snprintf(output_buf, output_size, "[");
 
     /* Add system message with system prompt */
-    char system_prompt[MIMI_CONTEXT_BUF_SIZE];
-    context_build_system_prompt(system_prompt, sizeof(system_prompt));
+    char *system_prompt = context_alloc_temp(MIMI_CONTEXT_BUF_SIZE);
+    if (!system_prompt) {
+        return ESP_ERR_NO_MEM;
+    }
+    context_build_system_prompt(system_prompt, MIMI_CONTEXT_BUF_SIZE);
 
     /* Escape the system prompt for JSON */
-    char escaped_prompt[MIMI_CONTEXT_BUF_SIZE * 2];
-    json_escape(escaped_prompt, sizeof(escaped_prompt), system_prompt);
+    char *escaped_prompt = context_alloc_temp(MIMI_CONTEXT_BUF_SIZE * 2);
+    if (!escaped_prompt) {
+        free(system_prompt);
+        return ESP_ERR_NO_MEM;
+    }
+    json_escape(escaped_prompt, MIMI_CONTEXT_BUF_SIZE * 2, system_prompt);
 
     off += snprintf(output_buf + off, output_size - off,
         "{\"role\":\"system\",\"content\":\"%s\"}", escaped_prompt);
+
+    free(escaped_prompt);
+    free(system_prompt);
 
     /* Add history messages */
     if (history && history[0] && history_size > 2) {
@@ -425,13 +493,17 @@ esp_err_t context_build_messages(const char *history, size_t history_size,
     json_escape(escaped_ctx, sizeof(escaped_ctx), runtime_ctx);
 
     /* Escape current message for JSON */
-    char escaped_msg[MIMI_CONTEXT_BUF_SIZE * 2];
-    json_escape(escaped_msg, sizeof(escaped_msg), current_message);
+    char *escaped_msg = context_alloc_temp(MIMI_CONTEXT_BUF_SIZE * 2);
+    if (!escaped_msg) {
+        return ESP_ERR_NO_MEM;
+    }
+    json_escape(escaped_msg, MIMI_CONTEXT_BUF_SIZE * 2, current_message);
 
     /* Add user message with runtime context + current message */
     off += snprintf(output_buf + off, output_size - off,
         ",{\"role\":\"user\",\"content\":\"%s\\n\\n%s\"}]",
         escaped_ctx, escaped_msg);
 
+    free(escaped_msg);
     return ESP_OK;
 }

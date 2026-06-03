@@ -13,11 +13,18 @@ static const char* const STATE_STRINGS[] = {
     "idle",
     "connecting",
     "listening",
+    "thinking",
     "speaking",
     "upgrading",
     "activating",
     "audio_testing",
     "fatal_error",
+    "error",
+    "wakeup_detected",
+    "uploading_audio",
+    "recognizing",
+    "synthesizing",
+    "reconnecting",
     "invalid_state"
 };
 
@@ -25,15 +32,20 @@ DeviceStateMachine::DeviceStateMachine() {
 }
 
 const char* DeviceStateMachine::GetStateName(DeviceState state) {
-    if (state >= 0 && state <= kDeviceStateFatalError) {
-        return STATE_STRINGS[state];
+    int idx = static_cast<int>(state);
+    if (idx >= 0 && idx < static_cast<int>(sizeof(STATE_STRINGS) / sizeof(STATE_STRINGS[0]))) {
+        return STATE_STRINGS[idx];
     }
-    return STATE_STRINGS[kDeviceStateFatalError + 1];
+    return STATE_STRINGS[(sizeof(STATE_STRINGS) / sizeof(STATE_STRINGS[0])) - 1];
 }
 
 bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) const {
     // Allow transition to the same state (no-op)
     if (from == to) {
+        return true;
+    }
+
+    if (to == kDeviceStateError && from != kDeviceStateFatalError) {
         return true;
     }
 
@@ -69,42 +81,71 @@ bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) con
                    to == kDeviceStateActivating;
 
         case kDeviceStateIdle:
-            // Can go to connecting, listening (manual mode), speaking, activating, upgrading, or wifi configuring
             return to == kDeviceStateConnecting ||
+                   to == kDeviceStateWakeupDetected ||
                    to == kDeviceStateListening ||
                    to == kDeviceStateSpeaking ||
+                   to == kDeviceStateSynthesizing ||
                    to == kDeviceStateActivating ||
                    to == kDeviceStateUpgrading ||
-                   to == kDeviceStateWifiConfiguring;
+                   to == kDeviceStateWifiConfiguring ||
+                   to == kDeviceStateReconnecting;
 
         case kDeviceStateConnecting:
-            // Can go to idle (failed) or listening (success)
             return to == kDeviceStateIdle ||
-                   to == kDeviceStateListening;
+                   to == kDeviceStateListening ||
+                   to == kDeviceStateWakeupDetected;
 
         case kDeviceStateListening:
-            // Can go to speaking, thinking, or idle
-            return to == kDeviceStateSpeaking ||
+            return to == kDeviceStateUploadingAudio ||
+                   to == kDeviceStateRecognizing ||
+                   to == kDeviceStateSpeaking ||
                    to == kDeviceStateThinking ||
                    to == kDeviceStateIdle;
 
         case kDeviceStateThinking:
-            // Can go to speaking, listening, or idle
-            return to == kDeviceStateSpeaking ||
+            return to == kDeviceStateSynthesizing ||
+                   to == kDeviceStateSpeaking ||
                    to == kDeviceStateListening ||
                    to == kDeviceStateIdle;
 
         case kDeviceStateSpeaking:
-            // Can go to listening or idle
             return to == kDeviceStateListening ||
                    to == kDeviceStateIdle;
 
         case kDeviceStateFatalError:
-            // Cannot transition out of fatal error
             return false;
 
+        case kDeviceStateError:
+            return to == kDeviceStateIdle ||
+                   to == kDeviceStateReconnecting ||
+                   to == kDeviceStateFatalError;
+
+        case kDeviceStateWakeupDetected:
+            return to == kDeviceStateListening ||
+                   to == kDeviceStateIdle;
+
+        case kDeviceStateUploadingAudio:
+            return to == kDeviceStateRecognizing ||
+                   to == kDeviceStateThinking ||
+                   to == kDeviceStateSynthesizing ||
+                   to == kDeviceStateIdle;
+
+        case kDeviceStateRecognizing:
+            return to == kDeviceStateThinking ||
+                   to == kDeviceStateSynthesizing ||
+                   to == kDeviceStateIdle;
+
+        case kDeviceStateSynthesizing:
+            return to == kDeviceStateSpeaking ||
+                   to == kDeviceStateIdle;
+
+        case kDeviceStateReconnecting:
+            return to == kDeviceStateIdle ||
+                   to == kDeviceStateFatalError;
+
         default:
-            return false;
+            return to == kDeviceStateIdle || to == kDeviceStateFatalError;
     }
 }
 

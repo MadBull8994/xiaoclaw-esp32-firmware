@@ -99,6 +99,9 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        if (callbacks_.on_pcm_output) {
+            callbacks_.on_pcm_output(data.data(), data.size());
+        }
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 
@@ -270,10 +273,17 @@ void AudioService::AudioInputTask() {
             int samples = 160; // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
+                // Capture raw PCM during the gap between wake word detection
+                // and audio processor start, so user speech right after wake word
+                // is not lost.
+                if (!(bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+                    WritePreWakeRingBuffer(data);
+                }
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
                     wake_word_->Feed(data);
                 }
                 if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
+                    FlushPreWakeRingBuffer();
                     audio_processor_->Feed(std::move(data));
                 }
                 continue;
@@ -418,6 +428,10 @@ void AudioService::OpusCodecTask() {
                 if (ret == ESP_AUDIO_ERR_OK) {
                     packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
 
+                    if (callbacks_.on_opus_frame && out.encoded_bytes > 0) {
+                        callbacks_.on_opus_frame(buf.data(), out.encoded_bytes);
+                    }
+
                     if (task->type == kAudioTaskTypeEncodeToSendQueue) {
                         {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
@@ -553,7 +567,21 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
     return nullptr;
 }
 
+void AudioService::DiscardPreWakeAudioOnNextFlush() {
+    pre_wake_ring_write_pos_ = 0;
+    pre_wake_ring_full_ = false;
+    pre_wake_ring_buffer_.clear();
+    discard_pre_wake_on_next_flush_ = true;
+}
+
 void AudioService::EnableWakeWordDetection(bool enable) {
+#if CONFIG_WAKE_WORD_DISABLED
+    if (enable) {
+        ESP_LOGD(TAG, "Wake word detection disabled by config");
+    }
+    xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+    return;
+#else
     if (enable) {
         // Lazy create wake_word_ if not yet created
         if (!wake_word_) {
@@ -589,6 +617,7 @@ void AudioService::EnableWakeWordDetection(bool enable) {
         }
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
     }
+#endif
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
@@ -668,7 +697,13 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     demuxer->Process(buf, size);
 }
 
-void AudioService::PlayOpusData(const std::vector<uint8_t>& opus_data, int sample_rate) {
+void AudioService::PlayOpusData(const std::vector<uint8_t>& opus_data,
+                                int sample_rate,
+                                int frame_duration_ms) {
+    if (opus_data.empty()) {
+        return;
+    }
+
     if (!codec_->output_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -677,9 +712,48 @@ void AudioService::PlayOpusData(const std::vector<uint8_t>& opus_data, int sampl
 
     auto packet = std::make_unique<AudioStreamPacket>();
     packet->sample_rate = sample_rate;
-    packet->frame_duration = 60;
+    packet->frame_duration = frame_duration_ms;
     packet->payload = opus_data;
     PushPacketToDecodeQueue(std::move(packet), true);
+}
+
+void AudioService::PlayTtsBinaryFrame(const uint8_t* data,
+                                      size_t len,
+                                      int sample_rate,
+                                      int frame_duration_ms) {
+    if (!data || len == 0 || len > 2048) {
+        return;
+    }
+
+    std::vector<uint8_t> opus_data(data, data + len);
+    PlayOpusData(opus_data, sample_rate, frame_duration_ms);
+}
+
+bool AudioService::PlayPcmData(std::vector<int16_t>&& pcm) {
+    if (pcm.empty()) {
+        return false;
+    }
+
+    if (!codec_->output_enabled()) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        codec_->EnableOutput(true);
+    }
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm = std::move(pcm);
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    audio_queue_cv_.wait(lock, [this]() {
+        return service_stopped_ || audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+    });
+    if (service_stopped_) {
+        return false;
+    }
+    audio_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    return true;
 }
 
 bool AudioService::IsIdle() {
@@ -715,6 +789,57 @@ void AudioService::ResetDecoder() {
     audio_queue_cv_.notify_all();
 }
 
+void AudioService::WritePreWakeRingBuffer(const std::vector<int16_t>& data) {
+    if (data.empty()) return;
+    if (pre_wake_ring_buffer_.empty()) {
+        pre_wake_ring_buffer_.resize(kPreWakeRingBufferSize, 0);
+    }
+    for (size_t i = 0; i < data.size(); i++) {
+        pre_wake_ring_buffer_[pre_wake_ring_write_pos_] = data[i];
+        pre_wake_ring_write_pos_++;
+        if (pre_wake_ring_write_pos_ >= kPreWakeRingBufferSize) {
+            pre_wake_ring_write_pos_ = 0;
+            pre_wake_ring_full_ = true;
+        }
+    }
+}
+
+std::vector<int16_t> AudioService::PopPreWakeRingBuffer() {
+    std::vector<int16_t> result;
+    if (pre_wake_ring_buffer_.empty()) return result;
+    result.reserve(kPreWakeRingBufferSize);
+    if (pre_wake_ring_full_) {
+        for (size_t i = pre_wake_ring_write_pos_; i < kPreWakeRingBufferSize; i++) {
+            result.push_back(pre_wake_ring_buffer_[i]);
+        }
+    }
+    for (size_t i = 0; i < pre_wake_ring_write_pos_; i++) {
+        result.push_back(pre_wake_ring_buffer_[i]);
+    }
+    pre_wake_ring_write_pos_ = 0;
+    pre_wake_ring_full_ = false;
+    pre_wake_ring_buffer_.clear();
+    return result;
+}
+
+void AudioService::FlushPreWakeRingBuffer() {
+    if (pre_wake_ring_buffer_.empty()) return;
+    if (discard_pre_wake_on_next_flush_) {
+        PopPreWakeRingBuffer();
+        discard_pre_wake_on_next_flush_ = false;
+        return;
+    }
+    if (!audio_processor_) {
+        PopPreWakeRingBuffer();
+        return;
+    }
+
+    auto data = PopPreWakeRingBuffer();
+    if (!data.empty()) {
+        audio_processor_->Feed(std::move(data));
+    }
+}
+
 void AudioService::CheckAndUpdateAudioPowerState() {
     auto now = std::chrono::steady_clock::now();
     auto input_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
@@ -736,6 +861,11 @@ void AudioService::CheckAndUpdateAudioPowerState() {
 void AudioService::SetModelsList(srmodel_list_t* models_list) {
     models_list_ = models_list;
 
+#if CONFIG_WAKE_WORD_DISABLED
+    wake_word_.reset();
+    wake_word_initialized_ = false;
+    return;
+#else
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
     if (esp_srmodel_filter(models_list_, ESP_MN_PREFIX, NULL) != nullptr) {
         wake_word_ = std::make_unique<CustomWakeWord>();
@@ -759,6 +889,7 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
             }
         });
     }
+#endif
 }
 
 bool AudioService::IsAfeWakeWord() {

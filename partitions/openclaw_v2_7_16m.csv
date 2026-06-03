@@ -1,0 +1,9 @@
+# OpenClaw V2.7 16MB flash partition table
+# Name,      Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x8000
+otadata,   data, ota,     0x11000,  0x2000
+phy_init,  data, phy,     0x13000,  0x1000
+ota_0,     app,  ota_0,   0x20000,  0x400000
+ota_1,     app,  ota_1,   0x420000, 0x400000
+model,     data, undefined, 0x820000, 0x50000
+fatfs,     data, fat,     0x870000, 0x560000

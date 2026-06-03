@@ -30,6 +30,7 @@
 #include "bus/message_bus.h"
 #include "llm/llm_proxy.h"
 #include "agent/agent_loop.h"
+#include "agent/context_builder.h"
 #include "memory/memory_store.h"
 #include "memory/session_manager.h"
 #include "proxy/http_proxy.h"
@@ -148,13 +149,25 @@ esp_err_t mimiclaw_init(void)
     /* Initialize FATFS (for memory/sessions/skills storage) */
     ESP_ERROR_CHECK(init_fatfs());
 
+    /* Preload prompt files from internal-stack context.
+       Agent_loop runs on PSRAM stack and must never touch FATFS. */
+    context_preload_files();
+
     /* Initialize core subsystems */
     ESP_ERROR_CHECK(message_bus_init());
     ESP_ERROR_CHECK(http_proxy_init());
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(agent_loop_init());
-    ESP_ERROR_CHECK(agent_loop_start());
+
+    /* Start agent_loop immediately — before cron/memory/skills/tools
+       fragment the internal DRAM heap. The agent blocks on inbound queue
+       until a message arrives, so subsystems can still init in parallel. */
+    esp_err_t start_err = agent_loop_start();
+    if (start_err != ESP_OK) {
+        ESP_LOGW(TAG, "agent_loop early start failed (%s) — will retry on first request",
+                 esp_err_to_name(start_err));
+    }
 
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(cron_service_start());
